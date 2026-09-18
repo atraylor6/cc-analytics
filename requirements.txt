@@ -4,3 +4,8 @@ numpy==2.4.6
 matplotlib==3.10.9
 openpyxl==3.1.5
 plotly==6.8.0
+reportlab==4.4.4
+python-dotenv==1.1.0
+xlsxwriter
+fredapi
+python-dateutil

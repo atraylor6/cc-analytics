@@ -26,6 +26,20 @@ from cc_data import (
     summary_stats,
 )
 import plotly.graph_objects as go
+import alerts_db
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.platypus import (
+    Image as RLImage,
+    KeepTogether,
+    PageBreak,
+    Paragraph,
+    SimpleDocTemplate,
+    Table,
+    TableStyle,
+)
 from attribution import (
     NEUTRAL_EQUITY,
     EQUITY_SUBMODELS,
@@ -68,6 +82,7 @@ def relative_drawdown_chart(portfolio, benchmark, ax=None):
     return ax
 
 
+alerts_db.init_db()
 st.set_page_config(page_title="CC Data Analytics", layout="wide", page_icon="📊")
 
 
@@ -188,7 +203,7 @@ SUBMODEL_ORDER = ["EAFE", "EM", "GV", "OMFL", "SGA", "T1F",
 with st.sidebar:
     st.title("📊 CC Data Analytics")
     st.divider()
-    page = st.radio("**Page**", ["Analytics", "Attribution"])
+    page = st.radio("**Page**", ["Analytics", "Attribution", "Price Alerts"])
     st.divider()
 
 
@@ -475,37 +490,8 @@ elif page == "Attribution":
 
         st.divider()
 
-        # ── Export ─────────────────────────────────────────────────────────────
+        # ── Table/detail data prep (shared by on-screen display and exports) ────
 
-        def _build_excel(tbl_, pos_):
-            buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine='openpyxl') as writer:
-                tbl_.to_excel(writer, sheet_name='Summary')
-                if 'Tier1' in pos_:
-                    pos_['Tier1'].to_excel(writer, sheet_name='Tier I')
-                if 'FixedIncome' in pos_ and not pos_['FixedIncome'].empty:
-                    pos_['FixedIncome'].to_excel(writer, sheet_name='Fixed Income')
-                for sm in SUBMODEL_ORDER:
-                    if sm in pos_ and not pos_[sm].empty:
-                        pos_[sm].to_excel(writer, sheet_name=sm[:31])
-            buf.seek(0)
-            return buf.getvalue()
-
-        st.download_button(
-            label="Download Excel",
-            data=_build_excel(tbl, pos),
-            file_name=f"attribution_{attr_start}_{attr_end}_Balanced.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
-        ATTR_COLS = ["Allocation (Passive)", "Allocation (Active)", "Selection", "Total"]
-        STAT_COLS = ["Wt%", "Bm Wt%", "Ret%", "Bm Ret%", "Contrib%", "Bm Contrib%"]
-        fmt_attr  = {
-            "Wt%": "{:.2f}", "Bm Wt%": "{:.2f}",
-            "Ret%": "{:.2f}", "Bm Ret%": "{:.2f}",
-            "Contrib%": "{:.3f}", "Bm Contrib%": "{:.3f}",
-            **{c: "{:.3f}" for c in ATTR_COLS},
-        }
         fmt_pos   = {"Avg Wt%": "{:.1f}", "Return%": "{:.2f}",
                      "Active Return%": "{:.2f}", "Contribution%": "{:.3f}"}
 
@@ -518,7 +504,6 @@ elif page == "Attribution":
         active_sms = [s for s in SUBMODEL_ORDER
                       if s in tbl.index and abs(float(tbl.loc[s, "Total"])) > 0.0005]
 
-        # ── Attribution Summary ─────────────────────────────────────────────────
         US_R1000_SMs  = [s for s in ("GV", "OMFL", "Sector") if s in active_sms]
         equity_detail = ([s for s in ("EAFE", "EM") if s in tbl.index]
                          + US_R1000_SMs
@@ -554,23 +539,259 @@ elif page == "Attribution":
         main_df.index = [DISP_NAMES.get(r, r) for r in main_df.index]
         main_df.index.name = "Effect"
 
+        eq_df = (tbl.loc[[r for r in equity_detail if r in tbl.index], DETL_COLS].copy()
+                 if equity_detail else pd.DataFrame())
+
+        BOND_COLS = [c for c in ["Wt%", "Ret%", "Bm Ret%", "Contrib%", "Selection"]
+                     if c in tbl.columns]
+        fmt_bond  = {"Wt%": "{:.2f}", "Ret%": "{:.2f}", "Bm Ret%": "{:.2f}",
+                     "Contrib%": "{:.3f}", "Selection": "{:.3f}"}
+        bd_df = (tbl.loc[[r for r in bond_detail if r in tbl.index], BOND_COLS].copy()
+                 if bond_detail else pd.DataFrame())
+
+        # ── Contribution chart (built once, reused on-screen and in the PDF) ────
+
+        chart_rows = ([s for s in ("EAFE", "EM") if s in tbl.index]
+                      + US_R1000_SMs
+                      + [s for s in SUBMODEL_ORDER
+                         if s not in ("EAFE", "EM", "GV", "OMFL", "Sector") and s in active_sms])
+        contrib_fig = None
+        chart_png   = None
+        if chart_rows:
+            totals = tbl.loc[chart_rows, "Total"].fillna(0)
+            bar_colors = ["#2ecc71" if v >= 0 else "#e74c3c" for v in totals]
+
+            contrib_fig, ax = plt.subplots(figsize=(max(6, len(totals) * 1.1), 2.8))
+            bars = ax.bar(totals.index, totals.values, color=bar_colors, width=0.55, edgecolor="white")
+            ax.axhline(0, color="black", linewidth=0.8)
+            ax.set_ylabel("Contribution (%)")
+            ax.grid(True, axis="y", alpha=0.3)
+            ax.set_axisbelow(True)
+            for bar, val in zip(bars, totals.values):
+                ax.text(bar.get_x() + bar.get_width() / 2,
+                        val,
+                        f"{val:.2f}",
+                        ha="center",
+                        va="bottom" if val >= 0 else "top",
+                        fontsize=8)
+            ymin, ymax = ax.get_ylim()
+            ax.set_ylim(ymin * 1.15, ymax * 1.15)
+            contrib_fig.tight_layout()
+
+            chart_buf = io.BytesIO()
+            contrib_fig.savefig(chart_buf, format="png", dpi=150, bbox_inches="tight")
+            chart_png = chart_buf.getvalue()
+
+        # ── Export ─────────────────────────────────────────────────────────────
+
+        def _build_excel(tbl_, pos_):
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+                tbl_.to_excel(writer, sheet_name='Summary')
+                if 'Tier1' in pos_:
+                    pos_['Tier1'].to_excel(writer, sheet_name='Tier I')
+                if 'FixedIncome' in pos_ and not pos_['FixedIncome'].empty:
+                    pos_['FixedIncome'].to_excel(writer, sheet_name='Fixed Income')
+                for sm in SUBMODEL_ORDER:
+                    if sm in pos_ and not pos_[sm].empty:
+                        pos_[sm].to_excel(writer, sheet_name=sm[:31])
+            buf.seek(0)
+            return buf.getvalue()
+
+        def _build_pdf():
+            styles = getSampleStyleSheet()
+            navy, gray, green, red = (colors.HexColor("#1a1a2e"), colors.HexColor("#666666"),
+                                       colors.HexColor("#1a8a3e"), colors.HexColor("#c0392b"))
+            title_style = ParagraphStyle("AttrTitle", parent=styles["Title"],
+                                          fontSize=18, textColor=navy, spaceAfter=2)
+            sub_style = ParagraphStyle("AttrSub", parent=styles["Normal"],
+                                        fontSize=10, textColor=gray, spaceAfter=16)
+            h2_style = ParagraphStyle("AttrH2", parent=styles["Heading2"],
+                                       fontSize=13, textColor=navy, spaceBefore=16, spaceAfter=6)
+            h3_style = ParagraphStyle("AttrH3", parent=styles["Heading3"],
+                                       fontSize=10.5, textColor=navy, spaceBefore=10, spaceAfter=4)
+            caption_style = ParagraphStyle("AttrCaption", parent=styles["Normal"],
+                                            fontSize=8, textColor=gray, spaceBefore=4, spaceAfter=10)
+
+            AVAIL_W = letter[0] - 1.2 * inch
+            IDX_W   = 1.4 * inch
+
+            hdr_style     = ParagraphStyle("AttrThead", fontName="Helvetica-Bold", fontSize=6.5,
+                                            leading=7.5, textColor=colors.white, alignment=1)
+            hdr_idx_style = ParagraphStyle("AttrThead0", parent=hdr_style, alignment=0)
+            idx_style     = ParagraphStyle("AttrTidx", fontName="Helvetica", fontSize=7.5, leading=9)
+
+            def _df_table(df, fmt):
+                n_cols = len(df.columns)
+                data_w = (AVAIL_W - IDX_W) / n_cols if n_cols else AVAIL_W
+                header = [Paragraph(df.index.name or "", hdr_idx_style)] + \
+                         [Paragraph(str(c), hdr_style) for c in df.columns]
+                rows = [header]
+                for idx_, row in df.iterrows():
+                    line = [Paragraph(str(idx_), idx_style)]
+                    for c in df.columns:
+                        v = row[c]
+                        line.append("--" if pd.isna(v) else fmt.get(c, "{}").format(v))
+                    rows.append(line)
+                t = Table(rows, colWidths=[IDX_W] + [data_w] * n_cols, repeatRows=1, hAlign="LEFT")
+                t.setStyle(TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), navy),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("FONTSIZE", (0, 1), (-1, -1), 7.5),
+                    ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
+                    ("ALIGN", (0, 0), (0, -1), "LEFT"),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#dddddd")),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f5f6fa")]),
+                    ("TOPPADDING", (0, 0), (-1, -1), 3),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 3),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+                ]))
+                return t
+
+            story = [
+                Paragraph("Attribution Report", title_style),
+                Paragraph(f"{model_name} &nbsp;|&nbsp; {attr_start} to {attr_end}", sub_style),
+            ]
+
+            metric_tbl = Table(
+                [["Portfolio " + ret_label, "Benchmark " + ret_label, "Excess Return"],
+                 [f"{_ann_ret(port_val):.2f}%", f"{_ann_ret(bench_val):.2f}%", f"{ann_exc:+.2f}%"]],
+                colWidths=[2.2 * inch] * 3,
+            )
+            metric_tbl.setStyle(TableStyle([
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, 0), 9),
+                ("TEXTCOLOR", (0, 0), (-1, 0), gray),
+                ("FONTNAME", (0, 1), (-1, 1), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 1), (-1, 1), 15),
+                ("TEXTCOLOR", (2, 1), (2, 1), green if ann_exc >= 0 else red),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("LINEBELOW", (0, 0), (-1, 0), 0.5, colors.HexColor("#cccccc")),
+                ("BOTTOMPADDING", (0, 0), (-1, 0), 4),
+                ("TOPPADDING", (0, 1), (-1, 1), 3),
+                ("BOTTOMPADDING", (0, 1), (-1, 1), 14),
+            ]))
+            story.append(metric_tbl)
+
+            story.append(KeepTogether([
+                Paragraph("Attribution Summary", h2_style),
+                _df_table(main_df, fmt_main),
+                Paragraph(
+                    "Wt% / Bm Wt%: avg portfolio and benchmark weights. Ret% / Bm Ret%: compounded "
+                    "period return. Contrib% / Bm Contrib%: Carino-linked contribution to total return. "
+                    "Attribution effects: Carino geometric excess return.", caption_style),
+            ]))
+
+            if not eq_df.empty:
+                story.append(KeepTogether([
+                    Paragraph("Stock Components", h2_style),
+                    _df_table(eq_df, fmt_detl),
+                ]))
+
+            if not bd_df.empty:
+                story.append(KeepTogether([
+                    Paragraph("Bond Components", h2_style),
+                    _df_table(bd_df, fmt_bond),
+                ]))
+
+            if chart_png:
+                w, h = contrib_fig.get_size_inches()
+                img_w = 6.7 * inch
+                story.append(KeepTogether([
+                    Paragraph("Sub-model Contributions", h2_style),
+                    RLImage(io.BytesIO(chart_png), width=img_w, height=img_w * h / w),
+                ]))
+
+            story.append(PageBreak())
+            story.append(Paragraph("Position Detail", h2_style))
+
+            if not equity_only:
+                if "Tier1" in pos and not pos["Tier1"].empty:
+                    fmt_t1 = {"Avg Wt%": "{:.1f}", "Neutral Wt%": "{:.1f}",
+                              "Active OW%": "{:.1f}", "Period Ret%": "{:.2f}"}
+                    story.append(KeepTogether([
+                        Paragraph("Tier I — Equity/Bond Timing", h3_style),
+                        _df_table(pos["Tier1"], fmt_t1),
+                        Paragraph(
+                            f"Effect = avg daily active equity OW × (ACWI − {_bond_label}) spread, "
+                            "Carino-linked", caption_style),
+                    ]))
+
+                fi_df_pdf = pos.get("FixedIncome", pd.DataFrame())
+                if not fi_df_pdf.empty:
+                    story.append(KeepTogether([
+                        Paragraph("Fixed Income — Selection", h3_style),
+                        _df_table(fi_df_pdf, fmt_pos),
+                        Paragraph(f"Active Return% vs {_bond_label}", caption_style),
+                    ]))
+
+            for sm in ([s for s in ("EAFE", "EM") if s in tbl.index]
+                       + US_R1000_SMs
+                       + [s for s in SUBMODEL_ORDER
+                          if s not in ("EAFE", "EM", "GV", "OMFL", "Sector") and s in active_sms]):
+                sm_pos = pos.get(sm, pd.DataFrame())
+                if sm_pos.empty:
+                    continue
+                sm_val = float(tbl.loc[sm, "Total"])
+                bench_label = "Russell 1000 (IWB)" if sm in R1000_SUBMODELS else "ACWI"
+                story.append(KeepTogether([
+                    Paragraph(f"{sm}   {_signed(sm_val)}", h3_style),
+                    _df_table(sm_pos, fmt_pos),
+                    Paragraph(f"Active Return% vs {bench_label}", caption_style),
+                ]))
+
+            def _footer(canvas, doc):
+                canvas.saveState()
+                canvas.setFont("Helvetica", 7)
+                canvas.setFillColor(gray)
+                canvas.drawString(0.6 * inch, 0.4 * inch,
+                                   f"Generated {date.today().isoformat()}  |  CC Data Analytics")
+                canvas.drawRightString(letter[0] - 0.6 * inch, 0.4 * inch, f"Page {doc.page}")
+                canvas.restoreState()
+
+            buf = io.BytesIO()
+            doc = SimpleDocTemplate(buf, pagesize=letter,
+                                     leftMargin=0.6 * inch, rightMargin=0.6 * inch,
+                                     topMargin=0.6 * inch, bottomMargin=0.6 * inch,
+                                     title=f"Attribution Report - {model_name}")
+            doc.build(story, onFirstPage=_footer, onLaterPages=_footer)
+            buf.seek(0)
+            return buf.getvalue()
+
+        _fname_model = model_name.replace(" ", "_")
+        dl1, dl2 = st.columns(2)
+        with dl1:
+            st.download_button(
+                label="⬇ Download Excel",
+                data=_build_excel(tbl, pos),
+                file_name=f"attribution_{attr_start}_{attr_end}_{_fname_model}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        with dl2:
+            st.download_button(
+                label="⬇ Download PDF",
+                data=_build_pdf(),
+                file_name=f"attribution_{attr_start}_{attr_end}_{_fname_model}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
+
+        st.divider()
+
         st.subheader("Attribution Summary")
         st.dataframe(main_df.style.format(fmt_main, na_rep="--"),
                      use_container_width=True, height=_tbl_h(main_df))
 
-        if equity_detail:
+        if not eq_df.empty:
             with st.expander("Stock Components"):
-                eq_df = tbl.loc[[r for r in equity_detail if r in tbl.index], DETL_COLS].copy()
                 st.dataframe(eq_df.style.format(fmt_detl, na_rep="--"),
                              use_container_width=True, height=_tbl_h(eq_df))
 
-        if bond_detail:
+        if not bd_df.empty:
             with st.expander("Bond Components"):
-                BOND_COLS = [c for c in ["Wt%", "Ret%", "Bm Ret%", "Contrib%", "Selection"]
-                             if c in tbl.columns]
-                fmt_bond  = {"Wt%": "{:.2f}", "Ret%": "{:.2f}", "Bm Ret%": "{:.2f}",
-                             "Contrib%": "{:.3f}", "Selection": "{:.3f}"}
-                bd_df = tbl.loc[[r for r in bond_detail if r in tbl.index], BOND_COLS].copy()
                 st.dataframe(bd_df.style.format(fmt_bond, na_rep="--"),
                              use_container_width=True, height=_tbl_h(bd_df))
 
@@ -624,32 +845,9 @@ elif page == "Attribution":
         # ── Contributions bar chart ────────────────────────────────────────────
 
         st.subheader("Sub-model Contributions")
-        chart_rows = ([s for s in ("EAFE", "EM") if s in tbl.index]
-                      + US_R1000_SMs
-                      + [s for s in SUBMODEL_ORDER
-                         if s not in ("EAFE", "EM", "GV", "OMFL", "Sector") and s in active_sms])
-        if chart_rows:
-            totals = tbl.loc[chart_rows, "Total"].fillna(0)
-            colors = ["#2ecc71" if v >= 0 else "#e74c3c" for v in totals]
-
-            fig, ax = plt.subplots(figsize=(max(6, len(totals) * 1.1), 2.8))
-            bars = ax.bar(totals.index, totals.values, color=colors, width=0.55, edgecolor="white")
-            ax.axhline(0, color="black", linewidth=0.8)
-            ax.set_ylabel("Contribution (%)")
-            ax.grid(True, axis="y", alpha=0.3)
-            ax.set_axisbelow(True)
-            for bar, val in zip(bars, totals.values):
-                ax.text(bar.get_x() + bar.get_width() / 2,
-                        val,
-                        f"{val:.2f}",
-                        ha="center",
-                        va="bottom" if val >= 0 else "top",
-                        fontsize=8)
-            ymin, ymax = ax.get_ylim()
-            ax.set_ylim(ymin * 1.15, ymax * 1.15)
-            fig.tight_layout()
-            st.pyplot(fig, use_container_width=True)
-            plt.close(fig)
+        if contrib_fig is not None:
+            st.pyplot(contrib_fig, use_container_width=True)
+            plt.close(contrib_fig)
 
     # ── Monthly Breakdown ──────────────────────────────────────────────────────
 
@@ -1076,3 +1274,57 @@ elif page == "Attribution":
                         "Equity Sub-Model Allocation Over Time"),
             use_container_width=True,
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE: PRICE ALERTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+elif page == "Price Alerts":
+    st.header("Price Alerts")
+    st.caption("Alerts are checked every 5 minutes by the background worker. One email is sent when a threshold is first crossed; it resets once the price moves back inside bounds.")
+
+    # ── Add alert ─────────────────────────────────────────────────────────────
+    st.subheader("Add Alert")
+    with st.form("add_alert_form", clear_on_submit=True):
+        col1, col2, col3 = st.columns(3)
+        ticker       = col1.text_input("Ticker", placeholder="e.g. AAPL")
+        above_price  = col2.number_input("Alert above ($)", min_value=0.0, value=0.0, step=0.50,
+                                         help="Leave at 0 to disable")
+        below_price  = col3.number_input("Alert below ($)", min_value=0.0, value=0.0, step=0.50,
+                                         help="Leave at 0 to disable")
+        notify_email = st.text_input("Notify email", value="mgilbert@balentine.com")
+        submitted    = st.form_submit_button("Add Alert", type="primary")
+
+    if submitted:
+        if not ticker:
+            st.warning("Enter a ticker symbol.")
+        elif not above_price and not below_price:
+            st.warning("Set at least one price threshold.")
+        else:
+            alerts_db.add_alert(
+                ticker,
+                above_price if above_price > 0 else None,
+                below_price if below_price > 0 else None,
+                notify_email,
+            )
+            st.success(f"Alert added for {ticker.upper().strip()}.")
+            st.rerun()
+
+    st.divider()
+
+    # ── Active alerts ─────────────────────────────────────────────────────────
+    st.subheader("Active Alerts")
+    active = alerts_db.get_active_alerts()
+    if active:
+        for alert in active:
+            c1, c2, c3, c4, c5 = st.columns([1, 2, 2, 3, 1])
+            c1.markdown(f"**{alert['ticker']}**")
+            c2.markdown(f"Above: ${alert['above_price']:.2f}" if alert["above_price"] else "Above: —")
+            c3.markdown(f"Below: ${alert['below_price']:.2f}" if alert["below_price"] else "Below: —")
+            c4.caption(alert["email"])
+            if c5.button("🗑", key=f"del_alert_{alert['id']}"):
+                alerts_db.deactivate_alert(alert["id"])
+                st.rerun()
+    else:
+        st.info("No active alerts. Add one above.")
