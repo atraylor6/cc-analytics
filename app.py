@@ -610,8 +610,6 @@ elif page == "Attribution":
                                        fontSize=13, textColor=navy, spaceBefore=16, spaceAfter=6)
             h3_style = ParagraphStyle("AttrH3", parent=styles["Heading3"],
                                        fontSize=10.5, textColor=navy, spaceBefore=10, spaceAfter=4)
-            caption_style = ParagraphStyle("AttrCaption", parent=styles["Normal"],
-                                            fontSize=8, textColor=gray, spaceBefore=4, spaceAfter=10)
 
             AVAIL_W = letter[0] - 1.2 * inch
             IDX_W   = 1.4 * inch
@@ -678,10 +676,6 @@ elif page == "Attribution":
             story.append(KeepTogether([
                 Paragraph("Attribution Summary", h2_style),
                 _df_table(main_df, fmt_main),
-                Paragraph(
-                    "Wt% / Bm Wt%: avg portfolio and benchmark weights. Ret% / Bm Ret%: compounded "
-                    "period return. Contrib% / Bm Contrib%: Carino-linked contribution to total return. "
-                    "Attribution effects: Carino geometric excess return.", caption_style),
             ]))
 
             if not eq_df.empty:
@@ -714,9 +708,6 @@ elif page == "Attribution":
                     story.append(KeepTogether([
                         Paragraph("Tier I — Equity/Bond Timing", h3_style),
                         _df_table(pos["Tier1"], fmt_t1),
-                        Paragraph(
-                            f"Effect = avg daily active equity OW × (ACWI − {_bond_label}) spread, "
-                            "Carino-linked", caption_style),
                     ]))
 
                 fi_df_pdf = pos.get("FixedIncome", pd.DataFrame())
@@ -724,7 +715,6 @@ elif page == "Attribution":
                     story.append(KeepTogether([
                         Paragraph("Fixed Income — Selection", h3_style),
                         _df_table(fi_df_pdf, fmt_pos),
-                        Paragraph(f"Active Return% vs {_bond_label}", caption_style),
                     ]))
 
             for sm in ([s for s in ("EAFE", "EM") if s in tbl.index]
@@ -735,11 +725,9 @@ elif page == "Attribution":
                 if sm_pos.empty:
                     continue
                 sm_val = float(tbl.loc[sm, "Total"])
-                bench_label = "Russell 1000 (IWB)" if sm in R1000_SUBMODELS else "ACWI"
                 story.append(KeepTogether([
                     Paragraph(f"{sm}   {_signed(sm_val)}", h3_style),
                     _df_table(sm_pos, fmt_pos),
-                    Paragraph(f"Active Return% vs {bench_label}", caption_style),
                 ]))
 
             def _footer(canvas, doc):
