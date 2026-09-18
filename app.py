@@ -197,6 +197,20 @@ MODEL_CONFIGS = {
 SUBMODEL_ORDER = ["EAFE", "EM", "GV", "OMFL", "SGA", "T1F",
                   "Sector", "SmallCap", "Art", "REIT", "Gold"]
 
+# Sub-model grouping for the Attribution page's Stock Components / Position
+# Detail breakdowns (Period Summary view). SGA has its own group since it
+# doesn't fit Momentum or Factors.
+SUBMODEL_GROUPS = [
+    ("Momentum", ["EAFE", "EM", "GV"]),
+    ("Factors",  ["T1F", "OMFL"]),
+    ("Sectors",  ["Sector"]),
+    ("SmallCap", ["SmallCap"]),
+    ("Art",      ["Art"]),
+    ("REIT",     ["REIT"]),
+    ("Gold",     ["Gold"]),
+    ("SGA",      ["SGA"]),
+]
+
 
 # ── Sidebar — page navigation ─────────────────────────────────────────────────
 
@@ -504,11 +518,16 @@ elif page == "Attribution":
         active_sms = [s for s in SUBMODEL_ORDER
                       if s in tbl.index and abs(float(tbl.loc[s, "Total"])) > 0.0005]
 
-        US_R1000_SMs  = [s for s in ("GV", "OMFL", "Sector") if s in active_sms]
-        equity_detail = ([s for s in ("EAFE", "EM") if s in tbl.index]
-                         + US_R1000_SMs
-                         + [s for s in SUBMODEL_ORDER
-                            if s not in ("EAFE", "EM", "GV", "OMFL", "Sector") and s in active_sms])
+        # Group sub-models for display (Momentum / Factors / Sectors / SmallCap / Art / REIT / Gold / SGA).
+        # EAFE and EM show whenever present at all (like before); everything else only if active.
+        grouped_sms = [
+            (gname, mem) for gname, mem in
+            ((g, [s for s in members
+                  if (s in ("EAFE", "EM") and s in tbl.index) or s in active_sms])
+             for g, members in SUBMODEL_GROUPS)
+            if mem
+        ]
+        equity_detail = [s for _, mem in grouped_sms for s in mem]
         _known_rows    = ({"Portfolio Return", "Benchmark Return", "Excess Return",
                            "Tier I (equity/bond)", "Fixed Income", "Total Stock", "Total Bond"}
                           | EQUITY_SUBMODELS)
@@ -539,8 +558,8 @@ elif page == "Attribution":
         main_df.index = [DISP_NAMES.get(r, r) for r in main_df.index]
         main_df.index.name = "Effect"
 
-        eq_df = (tbl.loc[[r for r in equity_detail if r in tbl.index], DETL_COLS].copy()
-                 if equity_detail else pd.DataFrame())
+        eq_group_dfs = [(gname, tbl.loc[[r for r in mem if r in tbl.index], DETL_COLS].copy())
+                        for gname, mem in grouped_sms]
 
         BOND_COLS = [c for c in ["Wt%", "Ret%", "Bm Ret%", "Contrib%", "Selection"]
                      if c in tbl.columns]
@@ -551,10 +570,7 @@ elif page == "Attribution":
 
         # ── Contribution chart (built once, reused on-screen and in the PDF) ────
 
-        chart_rows = ([s for s in ("EAFE", "EM") if s in tbl.index]
-                      + US_R1000_SMs
-                      + [s for s in SUBMODEL_ORDER
-                         if s not in ("EAFE", "EM", "GV", "OMFL", "Sector") and s in active_sms])
+        chart_rows = equity_detail
         contrib_fig = None
         chart_png   = None
         if chart_rows:
@@ -678,11 +694,18 @@ elif page == "Attribution":
                 _df_table(main_df, fmt_main),
             ]))
 
-            if not eq_df.empty:
+            if eq_group_dfs:
+                first_gname, first_gdf = eq_group_dfs[0]
                 story.append(KeepTogether([
                     Paragraph("Stock Components", h2_style),
-                    _df_table(eq_df, fmt_detl),
+                    Paragraph(first_gname, h3_style),
+                    _df_table(first_gdf, fmt_detl),
                 ]))
+                for gname, gdf in eq_group_dfs[1:]:
+                    story.append(KeepTogether([
+                        Paragraph(gname, h3_style),
+                        _df_table(gdf, fmt_detl),
+                    ]))
 
             if not bd_df.empty:
                 story.append(KeepTogether([
@@ -717,10 +740,7 @@ elif page == "Attribution":
                         _df_table(fi_df_pdf, fmt_pos),
                     ]))
 
-            for sm in ([s for s in ("EAFE", "EM") if s in tbl.index]
-                       + US_R1000_SMs
-                       + [s for s in SUBMODEL_ORDER
-                          if s not in ("EAFE", "EM", "GV", "OMFL", "Sector") and s in active_sms]):
+            for sm in equity_detail:
                 sm_pos = pos.get(sm, pd.DataFrame())
                 if sm_pos.empty:
                     continue
@@ -773,10 +793,12 @@ elif page == "Attribution":
         st.dataframe(main_df.style.format(fmt_main, na_rep="--"),
                      use_container_width=True, height=_tbl_h(main_df))
 
-        if not eq_df.empty:
+        if eq_group_dfs:
             with st.expander("Stock Components"):
-                st.dataframe(eq_df.style.format(fmt_detl, na_rep="--"),
-                             use_container_width=True, height=_tbl_h(eq_df))
+                for gname, gdf in eq_group_dfs:
+                    st.markdown(f"**{gname}**")
+                    st.dataframe(gdf.style.format(fmt_detl, na_rep="--"),
+                                 use_container_width=True, height=_tbl_h(gdf))
 
         if not bd_df.empty:
             with st.expander("Bond Components"):
@@ -813,10 +835,7 @@ elif page == "Attribution":
                     st.info("No fixed income positions in this period.")
                 st.caption(f"Active Return% vs {_bond_label}")
 
-        for sm in ([s for s in ("EAFE", "EM") if s in tbl.index]
-                   + US_R1000_SMs
-                   + [s for s in SUBMODEL_ORDER
-                      if s not in ("EAFE", "EM", "GV", "OMFL", "Sector") and s in active_sms]):
+        for sm in equity_detail:
             sm_val = float(tbl.loc[sm, "Total"])
             with st.expander(f"{sm}   {_signed(sm_val)}"):
                 sm_pos = pos.get(sm, pd.DataFrame())
